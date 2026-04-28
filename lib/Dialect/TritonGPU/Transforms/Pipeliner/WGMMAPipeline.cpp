@@ -307,6 +307,58 @@ SmallVector<Value> splitRhs(OpBuilder &builder,
   return ret;
 }
 
+static unsigned estimateDistributedRegs(RankedTensorType type, Operation *op) {
+  auto module = op->getParentOfType<ModuleOp>();
+  int numWarps = ttg::lookupNumWarps(op);
+  int threadsPerWarp = ttg::TritonGPUDialect::getThreadsPerWarp(module);
+  int elemsPerReg = std::max<int>(1, 32 / tt::getBitwidth(type));
+  int64_t registers = llvm::divideCeil(type.getNumElements(), elemsPerReg);
+  return llvm::divideCeil(registers, numWarps * threadsPerWarp);
+}
+
+static bool hasHighRSDotRegisterPressure(ttng::WarpGroupDotOp dotOp) {
+  auto aType = cast<RankedTensorType>(dotOp.getA().getType());
+  auto accType = dotOp.getC().getType();
+
+  // RS WGMMA keeps its LHS in registers until the async use is known to be
+  // complete. Splitting is helpful when latency hiding is the bottleneck, but
+  // for large register-resident LHS or accumulator tiles the extra async dot
+  // boundaries can push ptxas into the 255-register/spilling regime.
+  constexpr unsigned kMaxLhsRegsPerThreadBeforeSplit = 64;
+  constexpr unsigned kMaxAccRegsPerThreadBeforeSplit = 128;
+  // For narrow-N tiles, each unsplit WGMMA already covers few `m64nNk16`
+  // instructions, so splitting doesn't have enough work to amortize the
+  // extra async-dot boundary it introduces. Wider-N tiles benefit from the
+  // split even at moderate register pressure, so we only enforce the LHS /
+  // borderline-acc gate when N is narrow.
+  constexpr int64_t kNarrowNBlock = 64;
+
+  unsigned lhsRegs = estimateDistributedRegs(aType, dotOp);
+  unsigned accRegs = estimateDistributedRegs(accType, dotOp);
+
+  if (accRegs > kMaxAccRegsPerThreadBeforeSplit)
+    return true;
+
+  // Combined LHS + acc pressure: when both are at-or-above their thresholds
+  // the dot's own register footprint already sits at ~192 regs/thread (LHS
+  // held in registers across the async-dot boundary plus the accumulator),
+  // leaving little headroom for the rest of the kernel's live state. This
+  // catches RS dots whose K_BLOCK is large enough to make the LHS heavy --
+  // common GEMM configs like (M=128, N=256, K=64, num_warps=8) keep
+  // lhsRegs at ~16 and so still benefit from the split.
+  if (lhsRegs >= kMaxLhsRegsPerThreadBeforeSplit &&
+      accRegs >= kMaxAccRegsPerThreadBeforeSplit)
+    return true;
+
+  int64_t nBlock = accType.getShape().back();
+  if (nBlock <= kNarrowNBlock &&
+      (lhsRegs >= kMaxLhsRegsPerThreadBeforeSplit ||
+       accRegs >= kMaxAccRegsPerThreadBeforeSplit))
+    return true;
+
+  return false;
+}
+
 std::vector<ttng::WarpGroupDotOp> splitRSDot(ttng::WarpGroupDotOp dotOp) {
   // Splits wgmma(tensor, shmem, acc) into
   //   wgmma(tensor[:, :K//2], shmem[:K//2, :], acc)
@@ -317,6 +369,10 @@ std::vector<ttng::WarpGroupDotOp> splitRSDot(ttng::WarpGroupDotOp dotOp) {
   // fine-grained overlapping of the wgmma ops but empirically 2 splits gave the
   // best performance. In future this may be something we want to allow the user
   // to tune.
+  // 
+  // Avoid the split for shapes that are likely to be near the register limit:
+  // in that regime the extra async dot boundaries can cost more through spills
+  // than they save through overlap.
   if (!isa<RankedTensorType>(dotOp.getA().getType())) {
     return {dotOp};
   }
@@ -327,7 +383,7 @@ std::vector<ttng::WarpGroupDotOp> splitRSDot(ttng::WarpGroupDotOp dotOp) {
   auto instrK = cast<ttg::NvidiaMmaEncodingAttr>(dotOp.getType().getEncoding())
                     .getInstrShape()[2];
   // Nothing to split
-  if (origK <= instrK) {
+  if (origK <= instrK || hasHighRSDotRegisterPressure(dotOp)) {
     return {dotOp};
   }
   constexpr int numSplits = 2;
